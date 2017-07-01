@@ -17,6 +17,7 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+import copy
 import time
 
 # Dependency imports
@@ -27,6 +28,7 @@ from six.moves import xrange  # pylint: disable=redefined-builtin
 from tensor2tensor.utils import beam_search
 from tensor2tensor.utils import expert_utils as eu
 from tensor2tensor.utils import modality
+from tensor2tensor.utils import registry
 
 import tensorflow as tf
 
@@ -42,6 +44,14 @@ def _with_timing(fn, msg):
   return fn_with_timing
 
 
+def _is_class_modality(mod):
+  # TODO(lukaszkaiser): should be based on type, like CLASS_LABEL, not string.
+  prefix = "class_label_modality_"
+  if len(mod.name) < len(prefix):
+    return False
+  return mod.name[:len(prefix)] == prefix
+
+
 class T2TModel(object):
   """Abstract base class for models.
 
@@ -50,6 +60,7 @@ class T2TModel(object):
 
   def __init__(self,
                hparams,
+               mode,
                problem_hparams,
                problem_idx=0,
                data_parallelism=None,
@@ -58,6 +69,7 @@ class T2TModel(object):
 
     Args:
       hparams: a hyperparameters object.
+      mode: The execution mode, as defined in tf.contrib.learn.ModeKeys.
       problem_hparams: a hyperparameters object.
       problem_idx: an integer.
       data_parallelism: a expert_utils.parallelism
@@ -71,16 +83,57 @@ class T2TModel(object):
       data_parallelism = eu.Parallelism([""])
     if ps_devices is None:
       ps_devices = [""]
+    hparams = copy.copy(hparams)
+    hparams.add_hparam("mode", mode)
+    # when not in training mode, set all forms of dropout to zero.
+    if mode != tf.contrib.learn.ModeKeys.TRAIN:
+      for key in hparams.values():
+        if key[-len("dropout"):] == "dropout":
+          setattr(hparams, key, 0.0)
     self._hparams = hparams
     self._data_parallelism = data_parallelism
     self._num_datashards = data_parallelism.n
     self._ps_devices = ps_devices
     self._problem_hparams = problem_hparams
     self._problem_idx = problem_idx
+    self._create_modalities(problem_hparams, hparams)
+
+  def _create_modalities(self, problem_hparams, hparams):
+    """Construct modalities in problem_hparams."""
+
+    input_modality_overrides = {}
+    for override_str in hparams.input_modalities.split(";"):
+      parts = override_str.split(":")
+      feature_name = parts[0]
+      modality_name = ":".join(parts[1:])
+      input_modality_overrides[feature_name] = modality_name
+
+    target_modality_name = None
+    if hparams.target_modality:
+      target_modality_name = hparams.target_modality
+
+    input_modality = {}
+    for f, modality_spec in six.iteritems(problem_hparams.input_modality):
+      if isinstance(modality_spec, modality.Modality):
+        return
+      if f in input_modality_overrides:
+        _warn_changed_modality_type(input_modality_overrides[f],
+                                    modality_spec[0], f)
+        modality_spec = (input_modality_overrides[f], modality_spec[1])
+      input_modality[f] = registry.create_modality(modality_spec, hparams)
+    problem_hparams.input_modality = input_modality
+
+    target_modality_spec = problem_hparams.target_modality
+    if target_modality_name:
+      _warn_changed_modality_type(target_modality_name, target_modality_spec[0],
+                                  "target")
+      target_modality_spec = (target_modality_name, target_modality_spec[1])
+    target_modality = registry.create_modality(target_modality_spec, hparams)
+    problem_hparams.target_modality = target_modality
 
   @property
   def has_input(self):
-    return self._input_modality
+    return self._problem_hparams.input_modality
 
   def infer(self,
             features=None,
@@ -105,6 +158,14 @@ class T2TModel(object):
     Returns:
        samples: an integer `Tensor`.
     """
+    if not self.has_input:
+      # since there is no input, it is more interesting to see randomly
+      # generated sequences, than to see the most likely sequence repeatedly.
+      beam_size = 1
+      self._hparams.sampling_method = "random"
+    if _is_class_modality(
+        self._hparams.problems[self._problem_idx].target_modality):
+      beam_size = 1  # No use to run beam-search for a single class.
     if beam_size == 1:
       tf.logging.info("Greedy Decoding")
       return self._greedy_infer(features, decode_length, last_position_only)
@@ -163,7 +224,7 @@ class T2TModel(object):
                                     [s[0] * s[1], s[2], s[3], s[4]])
 
     target_modality = self._hparams.problems[self._problem_idx].target_modality
-    vocab_size = target_modality.targets_dimensionality
+    vocab_size = target_modality.top_dimensionality
     # Setting decode length to input length + decode_length
     decode_length = tf.shape(features["inputs"])[1] + tf.constant(decode_length)
     ids, scores = beam_search.beam_search(symbols_to_logits_fn, initial_ids,
@@ -203,6 +264,8 @@ class T2TModel(object):
     if "inputs" in features and len(features["inputs"].shape) < 4:
       inputs_old = features["inputs"]
       features["inputs"] = tf.expand_dims(features["inputs"], 2)
+    if not self.has_input:
+      features["partial_targets"] = tf.to_int64(features["inputs"])
 
     def infer_step(recent_output, _):
       """Inference step."""
@@ -234,8 +297,8 @@ class T2TModel(object):
     # input shape, so we confuse it about the input shape.
     initial_output = tf.slice(initial_output, [0, 0, 0, 0],
                               tf.shape(initial_output))
-    if isinstance(self._hparams.problems[self._problem_idx].target_modality,
-                  modality.ClassLabelModality):
+    if _is_class_modality(
+        self._hparams.problems[self._problem_idx].target_modality):
       decode_length = 1
     else:
       decode_length = tf.shape(features["inputs"])[1] + decode_length
@@ -290,12 +353,11 @@ class T2TModel(object):
                                                        0))
     return sharded_features
 
-  def model_fn(self, features, train, skip=False, last_position_only=False):
+  def model_fn(self, features, skip=False, last_position_only=False):
     """Computes the entire model and produces sharded logits and training loss.
 
     Args:
       features: A dictionary of feature name to tensor.
-      train: a boolean `Scalar` (whether we are in training mode).
       skip: a boolean, if we're just dummy-calling and actually skip this model
         (but we need to create variables to not confuse distributed training).
       last_position_only: a boolean, compute logits for only the last position.
@@ -322,7 +384,7 @@ class T2TModel(object):
       all_previous_modalities.extend(previous_modalities)
       do_reuse = input_modality.name in all_previous_modalities
       with tf.variable_scope(input_modality.name, reuse=do_reuse):
-        transformed_features[key] = input_modality.inputs_bottom_sharded(
+        transformed_features[key] = input_modality.bottom_sharded(
             sharded_features[key], dp)
       all_previous_modalities.append(input_modality.name)
 
@@ -350,11 +412,11 @@ class T2TModel(object):
         body_outputs, extra_loss = transformed_features["targets"], 0.0
       else:
         body_outputs, extra_loss = self.model_fn_body_sharded(
-            transformed_features, train)
+            transformed_features)
 
     with tf.variable_scope(target_modality.name, reuse=target_reuse):
       if not last_position_only:
-        sharded_logits, training_loss = (target_modality.targets_top_sharded(
+        sharded_logits, training_loss = (target_modality.top_sharded(
             body_outputs, sharded_features["targets"], self._data_parallelism))
 
         training_loss *= self._problem_hparams.loss_multiplier
@@ -369,7 +431,7 @@ class T2TModel(object):
             tf.expand_dims(target_shard[:, -1:, :, :], axis=[1])
             for target_shard in sharded_features["targets"]
         ]
-        sharded_logits, training_loss = (target_modality.targets_top_sharded(
+        sharded_logits, training_loss = (target_modality.top_sharded(
             last_position_body_outputs, last_position_targets,
             self._data_parallelism))
 
@@ -378,7 +440,7 @@ class T2TModel(object):
     tf.logging.info("This model_fn took %.3f sec." % (time.time() - start_time))
     return sharded_logits, training_loss, extra_loss
 
-  def model_fn_body_sharded(self, sharded_features, train):
+  def model_fn_body_sharded(self, sharded_features):
     """Mixture-of-experts models will override this function.
 
     Compute model body on all datashards.
@@ -386,7 +448,6 @@ class T2TModel(object):
     Args:
       sharded_features: map from string to list of Tensors each with shape
          [batch, ?, ?, body_input_size]
-      train: A boolean `Scalar` (whether we are in training mode).
 
     Returns:
       sharded_body_output:
@@ -400,7 +461,7 @@ class T2TModel(object):
       } for d in xrange(self._num_datashards)]
       output = self._data_parallelism(
           _with_timing(self.model_fn_body, "model_fn_body"),
-          datashard_to_features, train)
+          datashard_to_features)
       if isinstance(output, tuple):
         loss = tf.reduce_mean(output[1])
         output = output[0]
@@ -408,7 +469,7 @@ class T2TModel(object):
         loss = 0.0
       return output, loss
 
-  def model_fn_body(self, features, train):
+  def model_fn_body(self, features):
     """Most models will override this function.
 
     Compute label logits for one shard as a function of the transformed
@@ -417,7 +478,6 @@ class T2TModel(object):
     Args:
       features: A dictionary of key to Tensor.  Each Tensor has shape
          `[batch_size, ?, ?, hidden_size]`.
-      train: A boolean `Scalar` (whether we are in training mode).
 
     Returns:
       a `Tensor` of logits with shape `[batch_size, O, P, body_output_size]`.
@@ -427,3 +487,12 @@ class T2TModel(object):
   @property
   def hparams(self):
     return self._hparams
+
+
+def _warn_changed_modality_type(new_name, old_name, feature_name):
+  new_type, new_name = registry.parse_modality_name(new_name)
+  old_type, old_name = registry.parse_modality_name(old_name)
+  if new_type != old_type:
+    tf.logging.warning("%s has a designated modality type %s (%s) but has been "
+                       "overriden with a modality of type %s (%s).",
+                       feature_name, old_type, old_name, new_type, new_name)

@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for Neural GPU."""
+"""LSTMSeq2Seq models tests."""
 
 from __future__ import absolute_import
 from __future__ import division
@@ -24,39 +24,32 @@ import numpy as np
 
 from tensor2tensor.data_generators import problem_hparams
 from tensor2tensor.models import common_hparams
-from tensor2tensor.models import neural_gpu
+from tensor2tensor.models import lstm
 
 import tensorflow as tf
 
 
-class NeuralGPUTest(tf.test.TestCase):
+class LSTMTest(tf.test.TestCase):
 
-  def testNeuralGPU(self):
+  def testLSTMSeq2Seq(self):
+    vocab_size = 9
+    x = np.random.random_integers(1, high=vocab_size - 1, size=(3, 5, 1, 1))
+    y = np.random.random_integers(1, high=vocab_size - 1, size=(3, 6, 1, 1))
     hparams = common_hparams.basic_params1()
-    batch_size = 3
-    input_length = 5
-    target_length = input_length
-    input_vocab_size = 9
-    target_vocab_size = 11
-    p_hparams = problem_hparams.test_problem_hparams(hparams, input_vocab_size,
-                                                     target_vocab_size)
-    inputs = -1 + np.random.random_integers(
-        input_vocab_size, size=(batch_size, input_length, 1, 1))
-    targets = -1 + np.random.random_integers(
-        target_vocab_size, size=(batch_size, target_length, 1, 1))
+    p_hparams = problem_hparams.test_problem_hparams(hparams, vocab_size,
+                                                     vocab_size)
     with self.test_session() as session:
       features = {
-          "inputs": tf.constant(inputs, dtype=tf.int32),
-          "targets": tf.constant(targets, dtype=tf.int32)
+          "inputs": tf.constant(x, dtype=tf.int32),
+          "targets": tf.constant(y, dtype=tf.int32),
       }
-      model = neural_gpu.NeuralGPU(
+      model = lstm.LSTMSeq2Seq(
           hparams, tf.contrib.learn.ModeKeys.TRAIN, p_hparams)
-      shadred_logits, _, _ = model.model_fn(features)
-      logits = tf.concat(shadred_logits, 0)
+      sharded_logits, _, _ = model.model_fn(features)
+      logits = tf.concat(sharded_logits, 0)
       session.run(tf.global_variables_initializer())
       res = session.run(logits)
-    self.assertEqual(res.shape, (batch_size, target_length, 1, 1,
-                                 target_vocab_size))
+    self.assertEqual(res.shape, (3, 6, 1, 1, vocab_size))
 
 
 if __name__ == "__main__":

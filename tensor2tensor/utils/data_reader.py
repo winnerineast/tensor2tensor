@@ -100,6 +100,8 @@ def examples_queue(data_sources,
   with tf.name_scope("examples_queue"):
     # Read serialized examples using slim parallel_reader.
     num_epochs = None if training else 1
+    data_files = tf.contrib.slim.parallel_reader.get_data_files(data_sources)
+    num_readers = min(4 if training else 1, len(data_files))
     _, example_serialized = tf.contrib.slim.parallel_reader.parallel_read(
         data_sources,
         tf.TFRecordReader,
@@ -107,7 +109,7 @@ def examples_queue(data_sources,
         shuffle=training,
         capacity=2 * capacity,
         min_after_dequeue=capacity,
-        num_readers=4 if training else 1)
+        num_readers=num_readers)
 
     if data_items_to_decoders is None:
       data_items_to_decoders = {
@@ -201,6 +203,12 @@ def input_pipeline(data_file_pattern, capacity, mode):
             lambda img=inputs: resize(img))
       else:
         examples["inputs"] = tf.to_int64(resize(inputs))
+
+    elif ("image_cifar10" in data_file_pattern
+        and mode == tf.contrib.learn.ModeKeys.TRAIN):
+      examples["inputs"] = common_layers.cifar_image_augmentation(
+          examples["inputs"])
+
   elif "audio" in data_file_pattern:
     # Reshape audio to proper shape
     sample_count = tf.to_int32(examples.pop("audio/sample_count"))

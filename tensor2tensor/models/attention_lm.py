@@ -24,8 +24,6 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import copy
-
 # Dependency imports
 
 from six.moves import xrange  # pylint: disable=redefined-builtin
@@ -43,13 +41,9 @@ import tensorflow as tf
 class AttentionLM(t2t_model.T2TModel):
   """Attention net.  See file docstring."""
 
-  def model_fn_body(self, features, train):
+  def model_fn_body(self, features):
     # Remove dropout if not training
-    hparams = copy.copy(self._hparams)
-    if not train:
-      hparams.attention_dropout = 0.
-      hparams.relu_dropout = 0.
-      hparams.residual_dropout = 0.
+    hparams = self._hparams
     targets = features["targets"]
     targets = tf.squeeze(targets, 2)
 
@@ -145,7 +139,7 @@ def attention_lm_base():
   hparams.clip_grad_norm = 0.  # i.e. no gradient clipping
   hparams.optimizer_adam_epsilon = 1e-9
   hparams.learning_rate_decay_scheme = "noam"
-  hparams.learning_rate = 1.0
+  hparams.learning_rate = 0.1
   hparams.learning_rate_warmup_steps = 1000
   hparams.initializer_gain = 1.0
   hparams.num_hidden_layers = 6
@@ -154,7 +148,7 @@ def attention_lm_base():
   hparams.optimizer_adam_beta1 = 0.9
   hparams.optimizer_adam_beta2 = 0.98
   hparams.num_sampled_classes = 0
-  hparams.label_smoothing = 0.1
+  hparams.label_smoothing = 0.0
   hparams.shared_embedding_and_softmax_weights = int(False)
 
   hparams.add_hparam("filter_size", 4096)  # Add new ones like this.
@@ -162,8 +156,10 @@ def attention_lm_base():
   hparams.add_hparam("num_heads", 8)
   hparams.add_hparam("attention_key_channels", 0)
   hparams.add_hparam("attention_value_channels", 0)
+  # All hyperparameters ending in "dropout" are automatically set to 0.0
+  # when not in training mode.
   hparams.add_hparam("attention_dropout", 0.0)
   hparams.add_hparam("relu_dropout", 0.0)
-  hparams.add_hparam("pos", "timing")  # timing, none
   hparams.add_hparam("residual_dropout", 0.1)
+  hparams.add_hparam("pos", "timing")  # timing, none
   return hparams

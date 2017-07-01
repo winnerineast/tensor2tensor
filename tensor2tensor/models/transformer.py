@@ -16,7 +16,6 @@
 
 encoder: [Self-Attention, Feed-forward] x n
 decoder: [Self-Attention, Source-Target-Attention, Feed-forward] x n
-
 """
 
 from __future__ import absolute_import
@@ -42,13 +41,9 @@ import tensorflow as tf
 class Transformer(t2t_model.T2TModel):
   """Attention net.  See file docstring."""
 
-  def model_fn_body(self, features, train):
+  def model_fn_body(self, features):
     # Remove dropout if not training
     hparams = copy.copy(self._hparams)
-    if not train:
-      hparams.attention_dropout = 0.
-      hparams.relu_dropout = 0.
-      hparams.residual_dropout = 0.
     targets = features["targets"]
     inputs = features.get("inputs")
     target_space = features.get("target_space_id")
@@ -168,12 +163,7 @@ def transformer_encoder(encoder_input,
                 hparams.attention_dropout,
                 summaries=summaries,
                 name="encoder_self_attention"))
-        x = residual_fn(x,
-                        common_layers.conv_hidden_relu(
-                            x,
-                            hparams.filter_size,
-                            hparams.hidden_size,
-                            dropout=hparams.relu_dropout))
+        x = residual_fn(x, transformer_ffn_layer(x, hparams))
   return x
 
 
@@ -232,13 +222,47 @@ def transformer_decoder(decoder_input,
                 hparams.attention_dropout,
                 summaries=summaries,
                 name="encdec_attention"))
-        x = residual_fn(x,
-                        common_layers.conv_hidden_relu(
-                            x,
-                            hparams.filter_size,
-                            hparams.hidden_size,
-                            dropout=hparams.relu_dropout))
+        x = residual_fn(x, transformer_ffn_layer(x, hparams))
   return x
+
+
+def transformer_ffn_layer(x, hparams):
+  """Feed-forward layer in the transformer.
+
+  Args:
+    x: a Tensor of shape [batch_size, length, hparams.hidden_size]
+    hparams: hyperparmeters for model
+
+  Returns:
+    a Tensor of shape [batch_size, length, hparams.hidden_size]
+  """
+  if hparams.ffn_layer == "conv_hidden_relu":
+    return common_layers.conv_hidden_relu(
+        x,
+        hparams.filter_size,
+        hparams.hidden_size,
+        dropout=hparams.relu_dropout)
+  elif hparams.ffn_layer == "parameter_attention":
+    return common_attention.parameter_attention(
+        x,
+        hparams.parameter_attention_key_channels or hparams.hidden_size,
+        hparams.parameter_attention_value_channels or hparams.hidden_size,
+        hparams.hidden_size,
+        hparams.filter_size,
+        hparams.num_heads,
+        hparams.attention_dropout)
+  elif hparams.ffn_layer == "conv_hidden_relu_with_sepconv":
+    return common_layers.conv_hidden_relu(
+        x,
+        hparams.filter_size,
+        hparams.hidden_size,
+        kernel_size=(3, 1),
+        second_kernel_size=(31, 1),
+        padding="LEFT",
+        dropout=hparams.relu_dropout)
+  else:
+    assert hparams.ffn_layer == "none"
+    return x
 
 
 @registry.register_hparams
@@ -269,20 +293,76 @@ def transformer_base():
   hparams.add_hparam("num_heads", 8)
   hparams.add_hparam("attention_key_channels", 0)
   hparams.add_hparam("attention_value_channels", 0)
+  hparams.add_hparam("ffn_layer", "conv_hidden_relu")
+  hparams.add_hparam("parameter_attention_key_channels", 0)
+  hparams.add_hparam("parameter_attention_value_channels", 0)
+  # All hyperparameters ending in "dropout" are automatically set to 0.0
+  # when not in training mode.
   hparams.add_hparam("attention_dropout", 0.0)
   hparams.add_hparam("relu_dropout", 0.0)
-  hparams.add_hparam("pos", "timing")  # timing, none
   hparams.add_hparam("residual_dropout", 0.1)
+  hparams.add_hparam("pos", "timing")  # timing, none
   hparams.add_hparam("nbr_decoder_problems", 1)
   return hparams
 
 
 @registry.register_hparams
-def transformer_single_gpu():
+def transformer_big():
+  """HParams for transfomer big model on WMT."""
+  hparams = transformer_base()
+  hparams.hidden_size = 1024
+  hparams.filter_size = 4096
+  hparams.num_heads = 16
+  hparams.batching_mantissa_bits = 2
+  hparams.residual_dropout = 0.3
+  return hparams
+
+
+@registry.register_hparams
+def transformer_big_single_gpu():
+  """HParams for transformer big model for single gpu."""
+  hparams = transformer_big()
+  hparams.residual_dropout = 0.1
+  hparams.learning_rate_warmup_steps = 16000
+  hparams.optimizer_adam_beta2 = 0.998
+  hparams.batching_mantissa_bits = 3
+  return hparams
+
+
+@registry.register_hparams
+def transformer_base_single_gpu():
+  """HParams for transformer base model for single gpu."""
   hparams = transformer_base()
   hparams.batch_size = 8192
   hparams.learning_rate_warmup_steps = 16000
   hparams.batching_mantissa_bits = 2
+  return hparams
+
+
+@registry.register_hparams
+def transformer_parsing_base():
+  """Hparams for parsing on wsj only."""
+  hparams = transformer_base()
+  hparams.attention_dropout = 0.2
+  hparams.residual_dropout = 0.2
+  hparams.max_length = 512
+  hparams.learning_rate_warmup_steps = 16000
+  hparams.hidden_size = 1024
+  hparams.learning_rate = 0.05
+  hparams.shared_embedding_and_softmax_weights = int(False)
+  return hparams
+
+
+@registry.register_hparams
+def transformer_parsing_big():
+  """HParams for parsing on wsj semi-supervised."""
+  hparams = transformer_big()
+  hparams.max_length = 512
+  hparams.shared_source_target_embedding = int(False)
+  hparams.learning_rate_warmup_steps = 4000
+  hparams.residual_dropout = 0.1
+  hparams.batch_size = 2048
+  hparams.learning_rate = 0.05
   return hparams
 
 
@@ -442,44 +522,21 @@ def transformer_big_dr2():
 
 
 @registry.register_hparams
-def transformer_big_dr3():
-  hparams = transformer_big_dr1()
-  hparams.residual_dropout = 0.3
-  return hparams
-
-
-@registry.register_hparams
-def transformer_big_single_gpu():
-  hparams = transformer_big_dr1()
-  hparams.learning_rate_warmup_steps = 16000
-  hparams.optimizer_adam_beta2 = 0.998
-  hparams.batching_mantissa_bits = 3
-  return hparams
-
-
-@registry.register_hparams
-def transformer_parsing_base_dr6():
-  """hparams for parsing on wsj only."""
+def transformer_parameter_attention_a():
   hparams = transformer_base()
-  hparams.attention_dropout = 0.2
-  hparams.residual_dropout = 0.2
-  hparams.max_length = 512
-  hparams.learning_rate_warmup_steps = 16000
-  hparams.hidden_size = 1024
-  hparams.learning_rate = 0.5
-  hparams.shared_embedding_and_softmax_weights = int(False)
+  hparams.ffn_layer = "parameter_attention"
+  hparams.filter_size = 1536
   return hparams
 
 
 @registry.register_hparams
-def transformer_parsing_big():
-  """HParams for parsing on wsj semi-supervised."""
-  hparams = transformer_big_dr1()
-  hparams.max_length = 512
-  hparams.shared_source_target_embedding = int(False)
-  hparams.learning_rate_warmup_steps = 4000
-  hparams.batch_size = 2048
-  hparams.learning_rate = 0.5
+def transformer_parameter_attention_b():
+  hparams = transformer_base()
+  hparams.ffn_layer = "parameter_attention"
+  hparams.filter_size = 512
+  hparams.parameter_attention_key_channels = 1024
+  hparams.parameter_attention_value_channels = 1024
+  hparams.num_heads = 16
   return hparams
 
 

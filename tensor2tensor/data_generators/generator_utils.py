@@ -22,12 +22,12 @@ import gzip
 import io
 import os
 import tarfile
-import urllib
 
 # Dependency imports
 
 import six
 from six.moves import xrange  # pylint: disable=redefined-builtin
+import six.moves.urllib_request as urllib  # Imports urllib on Python2, urllib.request on Python3
 
 from tensor2tensor.data_generators.text_encoder import SubwordTextEncoder
 from tensor2tensor.data_generators.tokenizer import Tokenizer
@@ -126,6 +126,18 @@ def generate_files(generator,
   return output_files
 
 
+def download_report_hook(count, block_size, total_size):
+  """Report hook for download progress.
+
+  Args:
+    count: current block number
+    block_size: block size
+    total_size: total size
+  """
+  percent = int(count * block_size * 100 / total_size)
+  print("\r%d%%" % percent + " completed", end="\r")
+
+
 def maybe_download(directory, filename, url):
   """Download filename from url unless it's already in directory.
 
@@ -143,7 +155,12 @@ def maybe_download(directory, filename, url):
   filepath = os.path.join(directory, filename)
   if not tf.gfile.Exists(filepath):
     tf.logging.info("Downloading %s to %s" % (url, filepath))
-    filepath, _ = urllib.urlretrieve(url, filepath)
+    inprogress_filepath = filepath + ".incomplete"
+    inprogress_filepath, _ = urllib.urlretrieve(url, inprogress_filepath,
+                                                reporthook=download_report_hook)
+    # Print newline to clear the carriage return from the download progress
+    print()
+    tf.gfile.Rename(inprogress_filepath, filepath)
     statinfo = os.stat(filepath)
     tf.logging.info("Succesfully downloaded %s, %s bytes." % (filename,
                                                               statinfo.st_size))
@@ -225,9 +242,13 @@ def get_or_generate_vocab(tmp_dir, vocab_filename, vocab_size):
 
       # For some datasets a second extraction is necessary.
       if ".gz" in lang_file:
-        tf.logging.info("Unpacking subdirectory %s" % filepath)
         new_filepath = os.path.join(tmp_dir, lang_file[:-3])
-        gunzip_file(filepath, new_filepath)
+        if os.path.exists(new_filepath):
+          tf.logging.info("Subdirectory %s already exists, skipping unpacking"
+                          % filepath)
+        else:
+          tf.logging.info("Unpacking subdirectory %s" % filepath)
+          gunzip_file(filepath, new_filepath)
         filepath = new_filepath
 
       # Use Tokenizer to count the word occurrences.
@@ -241,7 +262,8 @@ def get_or_generate_vocab(tmp_dir, vocab_filename, vocab_size):
           _ = tokenizer.encode(line)
 
   vocab = SubwordTextEncoder.build_to_target_size(
-      vocab_size, tokenizer.token_counts, vocab_filepath, 1, 1e3)
+      vocab_size, tokenizer.token_counts, 1, 1e3)
+  vocab.store_to_file(vocab_filepath)
   return vocab
 
 

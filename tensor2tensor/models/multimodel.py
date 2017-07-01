@@ -20,6 +20,7 @@ from __future__ import print_function
 # Dependency imports
 
 from tensor2tensor.models import common_layers
+from tensor2tensor.models import modalities
 from tensor2tensor.models import slicenet
 from tensor2tensor.utils import expert_utils as eu
 from tensor2tensor.utils import registry
@@ -69,7 +70,8 @@ def experts(xs, moe_n1, moe_n2, hidden_size, filter_size, dp, ps, train):
 @registry.register_model
 class MultiModel(t2t_model.T2TModel):
 
-  def model_fn_body_sharded(self, sharded_features, train):
+  def model_fn_body_sharded(self, sharded_features):
+    train = self._hparams.mode == tf.contrib.learn.ModeKeys.TRAIN
     dp = self._data_parallelism
     hparams = self._hparams
     targets = sharded_features["targets"]
@@ -85,7 +87,7 @@ class MultiModel(t2t_model.T2TModel):
       inputs = common_layers.add_timing_signal(inputs)
       return slicenet.multi_conv_res(inputs, "SAME", "encoder1",
                                      hparams.num_hidden_layers // 2,
-                                     hparams, train, mask=inputs_mask)
+                                     hparams, mask=inputs_mask)
 
     target_space_emb = dp(slicenet.embed_target_space,
                           sharded_features["target_space_id"],
@@ -100,18 +102,18 @@ class MultiModel(t2t_model.T2TModel):
       expert_loss *= hparams.moe_loss_coef
     inputs_encoded = dp(
         slicenet.multi_conv_res, inputs_encoded, "SAME",
-        "encoder2", hparams.num_hidden_layers, hparams, train,
+        "encoder2", hparams.num_hidden_layers, hparams,
         mask=inputs_mask)
 
     # If we're just predicing a class, there is no use for a decoder, return.
-    target_modality = hparams.problems[self._problem_idx].target_modality
-    if "class_label_modality" in target_modality.name:
+    if isinstance(hparams.problems[self._problem_idx].target_modality,
+                  modalities.ClassLabelModality):
       return inputs_encoded, tf.reduce_mean(expert_loss)
 
     # Do the middle part.
     decoder_start, similarity_loss = dp(
         slicenet.slicenet_middle, inputs_encoded, targets,
-        target_space_emb, inputs_mask, hparams, train)
+        target_space_emb, inputs_mask, hparams)
 
     # Decode.
     decoder_half = dp(
@@ -136,7 +138,6 @@ class MultiModel(t2t_model.T2TModel):
         "decoder2",
         hparams.num_hidden_layers // 2,
         hparams,
-        train,
         mask=inputs_mask,
         source=inputs_encoded)
 
@@ -144,7 +145,7 @@ class MultiModel(t2t_model.T2TModel):
     return decoder_final, total_loss
 
 
-@registry.register_hparams("multimodel1p8")
+@registry.register_hparams("multimodel_1p8")
 def multimodel_params1_p8():
   """Version for eight problem runs."""
   hparams = slicenet.slicenet_params1()

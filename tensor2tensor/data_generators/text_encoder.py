@@ -23,6 +23,8 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
+from collections import defaultdict
+
 # Dependency imports
 
 import six
@@ -32,9 +34,13 @@ from tensor2tensor.data_generators import tokenizer
 import tensorflow as tf
 
 # Reserved tokens for things like padding and EOS symbols.
-PAD = '<pad>'
-EOS = '<EOS>'
+PAD = "<pad>"
+EOS = "<EOS>"
 RESERVED_TOKENS = [PAD, EOS]
+if six.PY2:
+  RESERVED_TOKENS_BYTES = RESERVED_TOKENS
+else:
+  RESERVED_TOKENS_BYTES = [bytes(PAD, "ascii"), bytes(EOS, "ascii")]
 
 
 class TextEncoder(object):
@@ -75,8 +81,8 @@ class TextEncoder(object):
       if 0 <= id_ < self._num_reserved_ids:
         decoded_ids.append(RESERVED_TOKENS[int(id_)])
       else:
-        decoded_ids.append(id_)
-    return '%s' % decoded_ids
+        decoded_ids.append(id_ - self._num_reserved_ids)
+    return " ".join([str(d) for d in decoded_ids])
 
   @property
   def vocab_size(self):
@@ -87,17 +93,25 @@ class ByteTextEncoder(TextEncoder):
   """Encodes each byte to an id. For 8-bit strings only."""
 
   def encode(self, s):
-    return [ord(c) + self._num_reserved_ids for c in s]
+    numres = self._num_reserved_ids
+    if six.PY2:
+      return [ord(c) + numres for c in s]
+    # Python3: explicitly convert to UTF-8
+    return [c + numres for c in s.encode("utf-8")]
 
   def decode(self, ids):
+    numres = self._num_reserved_ids
     decoded_ids = []
+    int2byte = six.int2byte
     for id_ in ids:
-      if 0 <= id_ < self._num_reserved_ids:
-        decoded_ids.append(RESERVED_TOKENS[int(id_)])
+      if 0 <= id_ < numres:
+        decoded_ids.append(RESERVED_TOKENS_BYTES[int(id_)])
       else:
-        decoded_ids.append(chr(id_))
-
-    return ''.join(decoded_ids)
+        decoded_ids.append(int2byte(id_ - numres))
+    if six.PY2:
+      return "".join(decoded_ids)
+    # Python3: join byte arrays and then decode string
+    return b"".join(decoded_ids).decode("utf-8")
 
   @property
   def vocab_size(self):
@@ -109,30 +123,25 @@ class TokenTextEncoder(TextEncoder):
 
   def __init__(self, vocab_filename, reverse=False, num_reserved_ids=2):
     """Initialize from a file, one token per line."""
-    self._reverse = reverse
-    if vocab_filename is None:
-      self._load_vocab_from_file(vocab_filename)
-
     super(TokenTextEncoder, self).__init__(num_reserved_ids=num_reserved_ids)
+    self._reverse = reverse
+    self._load_vocab_from_file(vocab_filename)
 
   def encode(self, sentence):
     """Converts a space-separated string of tokens to a list of ids."""
     ret = [self._token_to_id[tok] for tok in sentence.strip().split()]
-    if self._reverse:
-      ret = ret[::-1]
-    return ret
+    return ret[::-1] if self._reverse else ret
 
   def decode(self, ids):
-    if self._reverse:
-      ids = ids[::-1]
-    return ' '.join([self._safe_id_to_token(i) for i in ids])
+    seq = reversed(ids) if self._reverse else ids
+    return " ".join([self._safe_id_to_token(i) for i in seq])
 
   @property
   def vocab_size(self):
     return len(self._id_to_token)
 
   def _safe_id_to_token(self, idx):
-    return self._id_to_token.get(idx, 'ID_%d' % idx)
+    return self._id_to_token.get(idx, "ID_%d" % idx)
 
   def _load_vocab_from_file(self, filename):
     """Load vocab from a file."""
@@ -165,7 +174,7 @@ class SubwordTextEncoder(TextEncoder):
   """
 
   def __init__(self, filename=None, num_reserved_ids=2):
-    """Read from a file."""
+    """Initialize and read from a file, if provided."""
     self._tokenizer = tokenizer.Tokenizer()
     if filename is not None:
       self._load_from_file(filename)
@@ -218,21 +227,20 @@ class SubwordTextEncoder(TextEncoder):
     Returns:
       a list of strings.
     """
-    concatenated = ''.join(
+    concatenated = "".join(
         [self.subtoken_to_subtoken_string(s) for s in subtokens])
-    split = concatenated.split('_')
-    return [self._unescape_token(t + '_') for t in split if t]
+    split = concatenated.split("_")
+    return [self._unescape_token(t + "_") for t in split if t]
 
   def subtoken_to_subtoken_string(self, subtoken):
     """Subtoken_String (string) corresponding to the given subtoken (id)."""
-    if (subtoken >= 0 and subtoken < self.vocab_size and
-        self._all_subtoken_strings[subtoken]):
-      return self._all_subtoken_strings[subtoken]
-    else:
-      if 0 <= subtoken < self._num_reserved_ids:
-        return '%s_' % RESERVED_TOKENS[subtoken]
-      else:
-        return 'ID%d_' % subtoken
+    if 0 <= subtoken < self.vocab_size:
+      subtoken_string = self._all_subtoken_strings[subtoken]
+      if subtoken_string:
+        return subtoken_string
+    if 0 <= subtoken < self._num_reserved_ids:
+      return "%s_" % RESERVED_TOKENS[subtoken]
+    return "ID%d_" % subtoken
 
   def _escaped_token_to_subtokens(self, escaped_token):
     """Converts an escaped token string to a list of subtokens.
@@ -244,22 +252,40 @@ class SubwordTextEncoder(TextEncoder):
     """
     ret = []
     pos = 0
-    while pos < len(escaped_token):
-      end = len(escaped_token)
-      while True:
+    lesc = len(escaped_token)
+    while pos < lesc:
+      end = lesc
+      while end > pos:
         subtoken = self._subtoken_string_to_id.get(escaped_token[pos:end], -1)
         if subtoken != -1:
           break
         end -= 1
-      ret.append(subtoken)
-      pos = end
+      if end > pos:
+        ret.append(subtoken)
+        pos = end
+      else:
+        # No subtoken in the vocabulary matches escaped_token[pos].
+        # This can happen if the token contains a Unicode character
+        # that did not occur in the vocabulary training set.
+        # The id self.vocab_size - 1 is decoded as Unicode uFFFD,
+        # REPLACEMENT_CHARACTER.
+        ret.append(self.vocab_size - 1)
+        # Ensure that the outer loop continues
+        pos += 1
     return ret
+
+  @classmethod
+  def alphabet(cls, token_counts):
+    """Return the set of Unicode characters that appear in the tokens."""
+    alphabet_set = set()
+    for token in six.iterkeys(token_counts):
+      alphabet_set |= set(token)
+    return alphabet_set
 
   @classmethod
   def build_to_target_size(cls,
                            target_size,
                            token_counts,
-                           store_filename,
                            min_val,
                            max_val,
                            num_iterations=4):
@@ -271,7 +297,6 @@ class SubwordTextEncoder(TextEncoder):
     Args:
       target_size: desired vocab_size to approximate.
       token_counts: a dictionary of string to int.
-      store_filename: a string - where to write the vocabulary.
       min_val: an integer - lower bound for `min_count`.
       max_val: an integer - upper bound for `min_count`.
       num_iterations: an integer.  how many iterations of refinement.
@@ -279,43 +304,40 @@ class SubwordTextEncoder(TextEncoder):
     Returns:
       a SubwordTextEncoder instance.
     """
-    present_count = (max_val + min_val) // 2
-    tf.logging.info('Trying min_count %d' % present_count)
-    subtokenizer = cls()
-    subtokenizer.build_from_token_counts(token_counts, store_filename,
-                                         present_count, num_iterations)
+    # Calculate the alphabet, i.e. the set of all Unicode characters
+    # that appear in the tokens.
+    alphabet_set = cls.alphabet(token_counts)
+    tf.logging.info("Alphabet contains %d characters" % len(alphabet_set))
 
-    if min_val == max_val or subtokenizer.vocab_size == target_size:
+    def bisect(min_val, max_val):
+      present_count = (max_val + min_val) // 2
+      tf.logging.info("Trying min_count %d" % present_count)
+      subtokenizer = cls()
+      subtokenizer.build_from_token_counts(token_counts, alphabet_set,
+                                           present_count, num_iterations)
+      if min_val >= max_val or subtokenizer.vocab_size == target_size:
+        return subtokenizer
+      if subtokenizer.vocab_size > target_size:
+        other_subtokenizer = bisect(present_count + 1, max_val)
+      else:
+        other_subtokenizer = bisect(min_val, present_count - 1)
+      if (abs(other_subtokenizer.vocab_size - target_size) <
+          abs(subtokenizer.vocab_size - target_size)):
+        return other_subtokenizer
       return subtokenizer
-    elif subtokenizer.vocab_size > target_size:
-      other_subtokenizer = cls.build_to_target_size(
-          target_size, token_counts, store_filename, present_count + 1, max_val,
-          num_iterations)
-      if (abs(other_subtokenizer.vocab_size - target_size) <
-          abs(subtokenizer.vocab_size - target_size)):
-        return other_subtokenizer
-      else:
-        return subtokenizer
-    else:
-      other_subtokenizer = cls.build_to_target_size(
-          target_size, token_counts, store_filename, min_val, present_count - 1,
-          num_iterations)
-      if (abs(other_subtokenizer.vocab_size - target_size) <
-          abs(subtokenizer.vocab_size - target_size)):
-        return other_subtokenizer
-      else:
-        return subtokenizer
+
+    return bisect(min_val, max_val)
 
   def build_from_token_counts(self,
                               token_counts,
-                              store_filename,
+                              alphabet_set,
                               min_count,
                               num_iterations=4):
     """Train a SubwordTextEncoder based on a dictionary of word counts.
 
     Args:
-      token_counts: a dictionary of string to int.
-      store_filename: a string - where to write the vocabulary.
+      token_counts: a dictionary of Unicode strings to int.
+      alphabet_set: the set of Unicode characters that appear in the tokens.
       min_count: an integer - discard subtokens with lower counts.
       num_iterations: an integer.  how many iterations of refinement.
     """
@@ -323,81 +345,103 @@ class SubwordTextEncoder(TextEncoder):
     # then count the resulting potential subtokens, keeping the ones
     # with high enough counts for our new vocabulary.
     for i in xrange(num_iterations):
-      counts = {}
+      tf.logging.info("Iteration {0}".format(i))
+      counts = defaultdict(int)
       for token, count in six.iteritems(token_counts):
         escaped_token = self._escape_token(token)
         # we will count all tails of the escaped_token, starting from boundaries
         # determined by our current segmentation.
         if i == 0:
-          starts = list(range(len(escaped_token)))
+          starts = xrange(len(escaped_token))
         else:
           subtokens = self._escaped_token_to_subtokens(escaped_token)
           pos = 0
           starts = []
           for subtoken in subtokens:
             starts.append(pos)
-            pos += len(self.subtoken_to_subtoken_string(subtoken))
+            pos += len(self._all_subtoken_strings[subtoken])
         for start in starts:
           for end in xrange(start + 1, len(escaped_token) + 1):
             subtoken_string = escaped_token[start:end]
-            counts[subtoken_string] = counts.get(subtoken_string, 0) + count
-      # array of lists of candidate subtoken strings, by length
+            counts[subtoken_string] += count
+      # Array of sets of candidate subtoken strings, by length
       len_to_subtoken_strings = []
       for subtoken_string, count in six.iteritems(counts):
-        if count < min_count or len(subtoken_string) <= 1:
+        lsub = len(subtoken_string)
+        # All subtoken strings of length 1 are automatically included
+        # later, so we don't need to consider them here
+        if count < min_count or lsub <= 1:
           continue
-        while len(len_to_subtoken_strings) <= len(subtoken_string):
-          len_to_subtoken_strings.append([])
-        len_to_subtoken_strings[len(subtoken_string)].append(subtoken_string)
+        # Add this subtoken string to its length set
+        while len(len_to_subtoken_strings) <= lsub:
+          len_to_subtoken_strings.append(set())
+        len_to_subtoken_strings[lsub].add(subtoken_string)
       new_subtoken_strings = []
       # consider the candidates longest to shortest, so that if we accept
       # a longer subtoken string, we can decrement the counts of its prefixes.
-      for subtoken_strings in len_to_subtoken_strings[::-1]:
+      for subtoken_strings in reversed(len_to_subtoken_strings[2:]):
         for subtoken_string in subtoken_strings:
           count = counts[subtoken_string]
           if count < min_count:
             continue
-          new_subtoken_strings.append((-count, subtoken_string))
+          new_subtoken_strings.append((count, subtoken_string))
           for l in xrange(1, len(subtoken_string)):
             counts[subtoken_string[:l]] -= count
-      # make sure we have all single characters.
-      new_subtoken_strings.extend([(-counts.get(chr(i), 0), chr(i))
-                                   for i in xrange(2**8)])
-      new_subtoken_strings.sort()
-      self._init_from_list([''] * self._num_reserved_ids +
+      # Sort what we've got so far in decreasing order by count
+      new_subtoken_strings.sort(reverse=True)
+      # Add the alphabet set at the end of the vocabulary list
+      for char in alphabet_set:
+        new_subtoken_strings.append((0, char))
+      # Also include the Unicode REPLACEMENT CHARACTER to use
+      # when encountering previously unseen Unicode characters
+      # in the input (i.e. input external to the tokenizer training
+      # set, which may thus contain characters not in the alphabet_set).
+      # This must be the last entry in the subtoken vocabulary list.
+      new_subtoken_strings.append((0, u"\uFFFD"))
+      # Now we have a candidate vocabulary
+      self._init_from_list([u""] * self._num_reserved_ids +
                            [p[1] for p in new_subtoken_strings])
-      print('vocab_size = %d' % self.vocab_size)
+      tf.logging.info("vocab_size = %d" % self.vocab_size)
 
-    original = 'This sentence was encoded by the SubwordTextEncoder.'
+    original = "This sentence was encoded by the SubwordTextEncoder."
     encoded = self.encode(original)
     print(encoded)
     print([self.subtoken_to_subtoken_string(s) for s in encoded])
     decoded = self.decode(encoded)
     print(decoded)
     assert decoded == original
-    self._store_to_file(store_filename)
+
+  def dump(self):
+    """Debugging dump of the current subtoken vocabulary."""
+    subtoken_strings = [(i, s)
+                        for s, i in six.iteritems(self._subtoken_string_to_id)]
+    print(u", ".join(u"{0} : '{1}'".format(i, s)
+                     for i, s in sorted(subtoken_strings)))
 
   def _init_from_list(self, subtoken_strings):
     """Initialize from a list of subtoken strings."""
     self._all_subtoken_strings = subtoken_strings
-    self._subtoken_string_to_id = {}
-    for i in xrange(len(subtoken_strings)):
-      subtoken_string = subtoken_strings[i]
-      if subtoken_string:
-        self._subtoken_string_to_id[subtoken_string] = i
+    self._subtoken_string_to_id = {
+        s: i for i, s in enumerate(subtoken_strings) if s}
 
   def _load_from_file(self, filename):
     """Load from a file."""
     subtoken_strings = []
     with tf.gfile.Open(filename) as f:
       for line in f:
-        subtoken_strings.append(line.strip()[1:-1].decode('string-escape'))
+        if six.PY2:
+          subtoken_strings.append(line.strip()[1:-1].decode("utf-8"))
+        else:
+          subtoken_strings.append(line.strip()[1:-1])
     self._init_from_list(subtoken_strings)
 
-  def _store_to_file(self, filename):
-    with tf.gfile.Open(filename, 'w') as f:
+  def store_to_file(self, filename):
+    with tf.gfile.Open(filename, "w") as f:
       for subtoken_string in self._all_subtoken_strings:
-        f.write('\'' + subtoken_string.encode('string-escape') + '\'\n')
+        if six.PY2:
+          f.write("'" + subtoken_string.encode("utf-8") + "'\n")
+        else:
+          f.write("'" + subtoken_string + "'\n")
 
   def _escape_token(self, token):
     r"""Translate '\'->'\\' and '_'->'\u', then append '_'.
@@ -407,48 +451,31 @@ class SubwordTextEncoder(TextEncoder):
     Returns:
       escaped_token: a string
     """
-    return token.replace('\\', '\\\\').replace('_', '\\u') + '_'
+    return token.replace("\\", "\\\\").replace("_", "\\u") + "_"
 
   def _unescape_token(self, escaped_token):
     r"""Remove '_' from end, then translate '\\'->'\' and '\u'->'_'.
-
-    TODO(noam): There must be some better way to do this with regexps.
 
     Args:
       escaped_token: a string
     Returns:
       token: a string
     """
-    assert escaped_token[-1] == '_'
-    escaped_token = escaped_token[:-1]
-    if '\\' not in escaped_token:
-      return escaped_token
-    ret = ''
-    pos = 0
-    while pos < len(escaped_token):
-      if escaped_token[pos] == '\\' and pos + 1 < len(escaped_token):
-        if escaped_token[pos + 1] == 'u':
-          ret += '_'
-        else:
-          ret += escaped_token[pos + 1]
-        pos += 1
-      pos += 1
-    return ret
+    assert escaped_token[-1] == "_"
+    return escaped_token[:-1].replace("\\u", "_").replace("\\\\", "\\")
 
   @classmethod
   def get_token_counts(cls, text_filepattern, corpus_max_lines):
-    """Read the corpus and compute a dictionary of word counts."""
+    """Read the corpus and compute a dictionary of token counts."""
     tok = tokenizer.Tokenizer()
-    token_counts = {}
     lines_read = 0
     filenames = tf.gfile.Glob(text_filepattern)
     for text_filename in filenames:
       with tf.gfile.Open(text_filename) as f:
         for line in f:
-          tokens = tok.encode(line.strip())
-          for t in tokens:
-            token_counts[t] = token_counts.get(t, 0) + 1
+          # The tokenizer updates token_counts in encode()
+          tok.encode(line.strip())
           lines_read += 1
           if corpus_max_lines > 0 and lines_read > corpus_max_lines:
-            return token_counts
-    return token_counts
+            return tok.token_counts
+    return tok.token_counts

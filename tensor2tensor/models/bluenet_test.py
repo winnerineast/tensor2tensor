@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Baseline models tests."""
+"""BlueNet tests."""
 
 from __future__ import absolute_import
 from __future__ import division
@@ -23,32 +23,33 @@ from __future__ import print_function
 import numpy as np
 
 from tensor2tensor.data_generators import problem_hparams
-from tensor2tensor.models import baseline
-from tensor2tensor.models import common_hparams
+from tensor2tensor.models import bluenet
 
 import tensorflow as tf
 
 
-class BaselineTest(tf.test.TestCase):
+class BlueNetTest(tf.test.TestCase):
 
-  def testLSTMSeq2Seq(self):
+  def testBlueNet(self):
     vocab_size = 9
     x = np.random.random_integers(1, high=vocab_size - 1, size=(3, 5, 1, 1))
-    y = np.random.random_integers(1, high=vocab_size - 1, size=(3, 6, 1, 1))
-    hparams = common_hparams.basic_params1()
+    y = np.random.random_integers(1, high=vocab_size - 1, size=(3, 1, 1, 1))
+    hparams = bluenet.bluenet_tiny()
     p_hparams = problem_hparams.test_problem_hparams(hparams, vocab_size,
                                                      vocab_size)
     with self.test_session() as session:
+      tf.train.get_or_create_global_step()
       features = {
           "inputs": tf.constant(x, dtype=tf.int32),
           "targets": tf.constant(y, dtype=tf.int32),
       }
-      model = baseline.LSTMSeq2Seq(hparams, p_hparams)
-      sharded_logits, _, _ = model.model_fn(features, True)
+      model = bluenet.BlueNet(
+          hparams, tf.contrib.learn.ModeKeys.TRAIN, p_hparams)
+      sharded_logits, _, _ = model.model_fn(features)
       logits = tf.concat(sharded_logits, 0)
       session.run(tf.global_variables_initializer())
       res = session.run(logits)
-    self.assertEqual(res.shape, (3, 6, 1, 1, vocab_size))
+    self.assertEqual(res.shape, (3, 5, 1, 1, vocab_size))
 
 
 if __name__ == "__main__":

@@ -31,14 +31,29 @@ class AlgorithmicTest(tf.test.TestCase):
     counter = 0
     for d in algorithmic.identity_generator(3, 8, 10):
       counter += 1
-      self.assertEqual(d["inputs"], d["targets"])
+      self.assertEqual(d["inputs"] + [1], d["targets"])
     self.assertEqual(counter, 10)
 
   def testReverseGenerator(self):
     counter = 0
     for d in algorithmic.reverse_generator(3, 8, 10):
       counter += 1
-      self.assertEqual(list(reversed(d["inputs"])), d["targets"])
+      self.assertEqual(list(reversed(d["inputs"])) + [1], d["targets"])
+    self.assertEqual(counter, 10)
+
+  def testZipfDistribution(self):
+    # Following Zipf's Law with alpha equals 1: the first in rank is two times
+    # more probable/frequent that the second in rank, three times more prob/freq
+    # that the third in rank and so on.
+    d = algorithmic.zipf_distribution(10, 1.0001)
+    for i in xrange(len(d[1:])-1):
+      self.assertEqual("%.4f" % (abs(d[i+1]-d[i+2])*(i+2)), "%.4f" % d[1])
+
+  def testReverseGeneratorNlpLike(self):
+    counter = 0
+    for d in algorithmic.reverse_generator_nlplike(3, 8, 10):
+      counter += 1
+      self.assertEqual(list(reversed(d["inputs"])) + [1], d["targets"])
     self.assertEqual(counter, 10)
 
   def testLowerEndianToNumber(self):
@@ -63,9 +78,9 @@ class AlgorithmicTest(tf.test.TestCase):
     counter = 0
     for d in algorithmic.addition_generator(4, 8, 10):
       counter += 1
-      self.assertEqual(d["inputs"].count(5), 1)
+      self.assertEqual(d["inputs"].count(6), 1)
       self.assertEqual(d["inputs"].count(0), 0)
-      self.assertEqual(d["targets"].count(5), 0)
+      self.assertEqual(d["targets"].count(6), 0)
       self.assertEqual(d["targets"].count(0), 0)
     self.assertEqual(counter, 10)
 
@@ -73,9 +88,9 @@ class AlgorithmicTest(tf.test.TestCase):
     counter = 0
     for d in algorithmic.multiplication_generator(4, 8, 10):
       counter += 1
-      self.assertEqual(d["inputs"].count(5), 1)
+      self.assertEqual(d["inputs"].count(6), 1)
       self.assertEqual(d["inputs"].count(0), 0)
-      self.assertEqual(d["targets"].count(5), 0)
+      self.assertEqual(d["targets"].count(6), 0)
       self.assertEqual(d["targets"].count(0), 0)
     self.assertEqual(counter, 10)
 
